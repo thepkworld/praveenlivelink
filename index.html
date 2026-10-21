@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cricket Live Stream · Shaka Player</title>
+
+  <!-- Shaka Player UI styles -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/shaka-player@4.16.2/dist/controls.css">
+
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%; height: 100%;
+      background: #0a0a0a;
+      overflow: hidden;
+      font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    }
+    #player-container {
+      position: fixed; inset: 0;
+      background: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    video {
+      width: 100%; height: 100%;
+      object-fit: contain;
+      background: #000;
+    }
+    /* Simple loading / status badge */
+    #status {
+      position: fixed;
+      top: max(16px, env(safe-area-inset-top));
+      right: 16px;
+      z-index: 9997;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 6px 15px 6px 11px;
+      background: rgba(10,10,10,.88);
+      border: 1px solid rgba(255,255,255,.07);
+      font-size: 11.5px;
+      font-weight: 500;
+      letter-spacing: .2px;
+      border-radius: 24px;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity .25s ease, transform .25s ease;
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      white-space: nowrap;
+      box-shadow: 0 2px 14px rgba(0,0,0,.45);
+      color: #c0c0c0;
+    }
+    #status.show { opacity: 1; transform: translateY(0); }
+    .st-dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      display: inline-block;
+      background: #60a5fa;
+    }
+    #status.live .st-dot { background: #22d3a0; animation: dot-pulse 2s ease-in-out infinite; }
+    #status.warn .st-dot { background: #fb923c; animation: dot-pulse 1s ease-in-out infinite; }
+    #status.err .st-dot { background: #f87171; }
+    @keyframes dot-pulse {
+      0%,100% { opacity: 1; transform: scale(1); }
+      50% { opacity: .35; transform: scale(.55); }
+    }
+
+    /* Fit-button (from the original page) */
+    .sp-fit-btn {
+      background: transparent !important;
+      border: none !important;
+      cursor: pointer !important;
+      padding: 0 7px !important;
+      min-width: auto !important;
+      opacity: .75;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      transition: opacity .15s;
+      color: #fff !important;
+    }
+    .sp-fit-btn:hover { opacity: 1; }
+    .fit-pill {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .4px;
+      padding: 3px 7px;
+      border-radius: 4px;
+      line-height: 1;
+      border: 1.5px solid rgba(255,255,255,.28);
+      color: rgba(255,255,255,.8);
+      pointer-events: none;
+    }
+    .shaka-video-container { background-color: #000 !important; }
+    @media (max-width: 380px) { .fit-pill { font-size: 9px; padding: 2px 5px; } }
+  </style>
+</head>
+<body>
+
+  <div id="player-container">
+    <video id="video" autoplay muted playsinline preload="metadata"></video>
+  </div>
+
+  <div id="status" role="status" aria-live="polite">
+    <span class="st-dot"></span>
+    <span id="statusText">Loading…</span>
+  </div>
+
+  <!-- Shaka Player UI (includes the core player) -->
+  <script src="https://cdn.jsdelivr.net/npm/shaka-player@4.16.2/dist/shaka-player.ui.min.js"></script>
+
+  <script>
+    (function () {
+      "use strict";
+
+      // ============================================================
+      // 1. CONFIG – exactly the stream used on the source page
+      // ============================================================
+      const CONFIG = {
+        streamUrl: "https://jiotvmblive.cdn.jio.com/bpk-tv/Ten_3_MOB/WDVLive/index.mpd",
+        keyId: "68318f7c97c55ba6ab8d0398a88fed3e",
+        key: "d312fb3325b4eb9462b4a0d2b6794adf",
+        cookieUrl: "https://allrounder2-0.pages.dev/api/Sony-3.json"
+      };
+
+      // ============================================================
+      // 2. DOM references
+      // ============================================================
+      const video = document.getElementById("video");
+      const container = document.getElementById("player-container");
+      const statusEl = document.getElementById("status");
+      const statusText = document.getElementById("statusText");
+
+      let statusTimer = null;
+
+      function setStatus(msg, type, dur) {
+        if (!statusEl) return;
+        statusText.textContent = msg || "Live";
+        statusEl.className = "show " + (type || "live");
+        if (statusTimer) { clearTimeout(statusTimer); statusTimer = null; }
+        if (dur !== 0) {
+          statusTimer = setTimeout(function () {
+            statusEl.className = statusEl.className.replace("show", "").trim();
+            statusTimer = null;
+          }, dur || 4000);
+        }
+      }
+
+      // ============================================================
+      // 3. Fit-button injection (from the original page)
+      // ============================================================
+      function injectFitButton(containerEl, videoEl) {
+        const panel = containerEl.querySelector(".shaka-controls-button-panel");
+        if (!panel) return false;
+
+        const anchor = panel.querySelector(".shaka-fullscreen-button");
+        const FITS = ["contain", "fill", "cover"];
+        const FIT_LABELS = { contain: "Fit", fill: "Fill", cover: "Zoom" };
+        let fitIdx = 0;
+
+        const fitBtn = document.createElement("button");
+        fitBtn.className = "sp-fit-btn";
+        fitBtn.title = "Video Fit: " + FIT_LABELS.contain;
+        fitBtn.setAttribute("aria-label", "Cycle Video Fit Mode");
+        fitBtn.innerHTML = '<span class="fit-pill">—</span>';
+
+        if (anchor) panel.insertBefore(fitBtn, anchor);
+        else panel.appendChild(fitBtn);
+
+        let currentRatio = "—";
+
+        function applyFit(i) {
+          fitIdx = i;
+          const m = FITS[i];
+          videoEl.classList.remove("mode-fill", "mode-cover");
+          if (m === "fill") videoEl.classList.add("mode-fill");
+          if (m === "cover") videoEl.classList.add("mode-cover");
+          fitBtn.classList.remove("mode-fill", "mode-cover");
+          if (m !== "contain") fitBtn.classList.add("mode-" + m);
+          fitBtn.title = "Video Fit: " + FIT_LABELS[m];
+          const pill = fitBtn.querySelector(".fit-pill");
+          if (pill) pill.textContent = (m === "contain") ? currentRatio : FIT_LABELS[m];
+        }
+
+        fitBtn.addEventListener("click", function (e) {
+          e.stopPropagation();
+          applyFit((fitIdx + 1) % FITS.length);
+        });
+
+        ["fullscreenchange", "webkitfullscreenchange"].forEach(function (ev) {
+          document.addEventListener(ev, function () {
+            // optional: adjust on fullscreen change
+          });
+        });
+
+        // Update ratio label when video metadata is available
+        function updateRatio() {
+          if (videoEl.videoWidth > 0) {
+            const ratio = videoEl.videoWidth + ":" + videoEl.videoHeight;
+            currentRatio = ratio;
+            if (FITS[fitIdx] === "contain") {
+              const pill = fitBtn.querySelector(".fit-pill");
+              if (pill) pill.textContent = ratio;
+            }
+          }
+        }
+        videoEl.addEventListener("loadedmetadata", updateRatio);
+        videoEl.addEventListener("resize", updateRatio);
+        videoEl.addEventListener("timeupdate", function onFirstFrame() {
+          videoEl.removeEventListener("timeupdate", onFirstFrame);
+          updateRatio();
+        });
+        updateRatio();
+
+        return true;
+      }
+
+      // ============================================================
+      // 4. Main initialisation
+      // ============================================================
+      async function initPlayer() {
+        // Install polyfills
+        shaka.polyfill.installAll();
+
+        if (!shaka.Player.isBrowserSupported()) {
+          setStatus("Browser not supported", "err", 0);
+          console.error("Shaka Player is not supported in this browser.");
+          return;
+        }
+
+        // Create Player and attach to video element
+        const player = new shaka.Player();
+        await player.attach(video);
+
+        // Build UI overlay
+        const ui = new shaka.ui.Overlay(player, container, video);
+        ui.configure({
+          controlPanelElements: [
+            "play_pause",
+            "time_and_duration",
+            "spacer",
+            "mute",
+            "volume",
+            "captions",
+            "quality",
+            "fullscreen"
+          ],
+          seekBarColors: {
+            base: "#828282",
+            buffered: "#ffc336",
+            played: "#1fc7ff"
+          }
+        });
+
+        // Inject fit button
+        let injectCount = 0;
+        (function tryInject() {
+          if (injectFitButton(container, video)) return;
+          if (++injectCount < 5) setTimeout(tryInject, 150);
+        })();
+
+        // DRM & streaming configuration
+        player.configure({
+          drm: {
+            clearKeys: { [CONFIG.keyId]: CONFIG.key }
+          },
+          manifest: { defaultPresentationDelay: 5 },
+          streaming: {
+            lowLatencyMode: true,
+            bufferingGoal: 10,
+            rebufferingGoal: 2,
+            safeSeekOffset: 5
+          }
+        });
+
+        // Fetch cookie for authentication
+        let cookieValue = "";
+        try {
+          const response = await fetch(CONFIG.cookieUrl, { cache: "no-store" });
+          const data = await response.json();
+          cookieValue = data.cookie || "";
+        } catch (e) {
+          console.warn("Cookie fetch failed, continuing without cookie");
+        }
+
+        if (cookieValue) {
+          player.getNetworkingEngine().registerRequestFilter((type, request) => {
+            request.headers["Referer"] = "https://www.jiotv.com/";
+            request.headers["User-Agent"] =
+              "plaYtv/7.1.5 (Linux;Android 13) ExoPlayerLib/2.11.6";
+            request.headers["Cookie"] = cookieValue;
+
+            let urlCookie = cookieValue.startsWith("__hdnea__=")
+              ? cookieValue.slice(10)
+              : cookieValue;
+            if (
+              (type === shaka.net.NetworkingEngine.RequestType.MANIFEST ||
+                type === shaka.net.NetworkingEngine.RequestType.SEGMENT) &&
+              !request.uris[0].includes("__hdnea__")
+            ) {
+              const sep = request.uris[0].includes("?") ? "&" : "?";
+              request.uris[0] += sep + "__hdnea__=" + urlCookie;
+            }
+          });
+        }
+
+        // Load the stream
+        try {
+          setStatus("Loading…", "warn", 0);
+          await player.load(CONFIG.streamUrl);
+          setStatus("Live", "live", 4000);
+          video.play().catch(function () {});
+        } catch (e) {
+          console.error("Player load error:", e);
+          setStatus("Error loading stream", "err", 0);
+        }
+
+        // Unmute on play
+        video.addEventListener("play", function () {
+          video.muted = false;
+        });
+
+        function unmuteOnce() {
+          video.muted = false;
+        }
+        container.addEventListener("pointerdown", unmuteOnce, {
+          capture: true,
+          once: true
+        });
+        container.addEventListener("click", unmuteOnce, {
+          capture: true,
+          once: true
+        });
+
+        // Error handling
+        player.addEventListener("error", function (ev) {
+          const err = ev.detail;
+          setStatus("Stream error: " + (err.code || ""), "err", 5000);
+        });
+      }
+
+      // Kick off when DOM is ready
+      document.addEventListener("DOMContentLoaded", initPlayer);
+    })();
+  </script>
+</body>
+</html>
